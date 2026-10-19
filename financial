@@ -1,0 +1,379 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import feedparser
+import requests
+import re
+from io import BytesIO
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
+
+st.set_page_config(
+    page_title="Financial Due Diligence Agent",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 Multi-Source Financial Due Diligence Agent")
+st.write("AI-assisted company research and financial risk analysis")
+
+# -------------------------------
+# Document Analysis Agent
+# -------------------------------
+def extract_documents(files):
+    documents = []
+
+    for file in files:
+        try:
+            if file.name.lower().endswith(".pdf"):
+                reader = PdfReader(BytesIO(file.getvalue()))
+                content = "\n".join(
+                    page.extract_text() or "" for page in reader.pages
+                )
+            else:
+                content = file.getvalue().decode(
+                    "utf-8", errors="ignore"
+                )
+
+            documents.append({
+                "source": file.name,
+                "text": content
+            })
+        except Exception as error:
+            st.warning(f"Could not read {file.name}: {error}")
+
+    return documents
+
+
+def retrieve_documents(documents, query):
+    if not documents:
+        return []
+
+    chunks = []
+    for doc in documents:
+        # Split long documents into overlapping sections
+        words = doc["text"].split()
+        for start in range(0, len(words), 150):
+            chunk = " ".join(words[start:start + 180])
+            if chunk.strip():
+                chunks.append({
+                    "source": doc["source"],
+                    "text": chunk
+                })
+
+    if not chunks:
+        return []
+
+    texts = [chunk["text"] for chunk in chunks]
+
+    try:
+        vectorizer = TfidfVectorizer(
+            stop_words="english",
+            max_features=5000
+        )
+        matrix = vectorizer.fit_transform(texts + [query])
+        scores = cosine_similarity(
+            matrix[-1], matrix[:-1]
+        ).flatten()
+
+        ranked = scores.argsort()[::-1][:5]
+
+        return [
+            {**chunks[i], "score": float(scores[i])}
+            for i in ranked if scores[i] > 0
+        ]
+    except ValueError:
+        return []
+
+
+# -------------------------------
+# Research Agent: Financial Data
+# -------------------------------
+def get_financial_data(ticker_symbol):
+    ticker = yf.Ticker(ticker_symbol)
+    info = ticker.info
+    history = ticker.history(period="1y")
+
+    financials = {
+        "Company": info.get("longName", ticker_symbol),
+        "Ticker": ticker_symbol,
+        "Sector": info.get("sector", "Unavailable"),
+        "Market Capitalization": info.get("marketCap"),
+        "Revenue": info.get("totalRevenue"),
+        "Net Income": info.get("netIncomeToCommon"),
+        "Total Debt": info.get("totalDebt"),
+        "Cash": info.get("totalCash"),
+        "Profit Margin": info.get("profitMargins"),
+        "Debt-to-Equity": info.get("debtToEquity"),
+        "Current Ratio": info.get("currentRatio"),
+        "Operating Cash Flow": info.get("operatingCashflow"),
+        "52-Week High": info.get("fiftyTwoWeekHigh"),
+        "52-Week Low": info.get("fiftyTwoWeekLow")
+    }
+
+    return financials, history
+
+
+# -------------------------------
+# Research Agent: Public News
+# -------------------------------
+def get_company_news(company_name):
+    query = requests.utils.quote(
+        f'"{company_name}" company finance'
+    )
+    url = (
+        "https://news.google.com/rss/search?q="
+        + query + "&hl=en-IN&gl=IN&ceid=IN:en"
+    )
+
+    feed = feedparser.parse(url)
+    articles = []
+
+    for entry in feed.entries[:15]:
+        articles.append({
+            "Date": entry.get("published", "Unknown"),
+            "Headline": entry.get("title", "No title"),
+            "Source": entry.get("source", {}).get(
+                "title", "News feed"
+            ),
+            "URL": entry.get("link", "")
+        })
+
+    return articles
+
+
+# -------------------------------
+# Synthesis Agent: Risk Analysis
+# -------------------------------
+def analyze_risks(financials, news, documents):
+    risks = []
+    warnings = []
+
+    revenue = financials.get("Revenue")
+    net_income = financials.get("Net Income")
+    debt = financials.get("Total Debt")
+    cash = financials.get("Cash")
+    margin = financials.get("Profit Margin")
+    current_ratio = financials.get("Current Ratio")
+
+    if isinstance(revenue, (int, float)) and revenue < 0:
+        risks.append("Negative reported revenue; verify the source data.")
+
+    if isinstance(net_income, (int, float)) and net_income < 0:
+        risks.append("Reported net loss: investigate profitability.")
+
+    if isinstance(debt, (int, float)) and isinstance(
+        cash, (int, float)
+    ) and debt > cash:
+        risks.append(
+            "Total debt exceeds cash; review liquidity and repayment needs."
+        )
+
+    if isinstance(margin, (int, float)) and margin < 0:
+        risks.append("Negative profit margin: investigate operating costs.")
+
+    if isinstance(current_ratio, (int, float)) and current_ratio < 1:
+        risks.append(
+            "Current ratio below 1: short-term liquidity may need review."
+        )
+
+    if not risks:
+        risks.append(
+            "No predefined financial warning was triggered. "
+            "This does not mean the company is risk-free."
+        )
+
+    # Flag headlines for human review; keywords are not proof of wrongdoing.
+    keywords = [
+        "fraud", "lawsuit", "investigation", "default",
+        "bankruptcy", "penalty", "recall", "probe"
+    ]
+
+    flagged_news = []
+    for item in news:
+        headline = item["Headline"]
+        if any(word in headline.lower() for word in keywords):
+            flagged_news.append(headline)
+
+    if flagged_news:
+        warnings.append(
+            "News headlines requiring verification: "
+            + "; ".join(flagged_news[:5])
+        )
+
+    if documents:
+        warnings.append(
+            f"{len(documents)} uploaded document(s) available for retrieval."
+        )
+
+    return risks, warnings
+
+
+# -------------------------------
+# User Interface
+# -------------------------------
+with st.sidebar:
+    st.header("Company Details")
+    company = st.text_input(
+        "Company name",
+        value="Reliance Industries"
+    )
+    ticker = st.text_input(
+        "Yahoo Finance ticker",
+        value="RELIANCE.NS"
+    )
+    uploaded_files = st.file_uploader(
+        "Upload annual reports, contracts or risk documents",
+        type=["pdf", "txt"],
+        accept_multiple_files=True
+    )
+
+    run_analysis = st.button(
+        "Generate Risk Report",
+        type="primary"
+    )
+
+if run_analysis:
+    if not company.strip() or not ticker.strip():
+        st.error("Enter both company name and ticker.")
+        st.stop()
+
+    with st.spinner("Research Agent is collecting financial data..."):
+        try:
+            financials, history = get_financial_data(
+                ticker.strip()
+            )
+        except Exception as error:
+            st.error(f"Could not retrieve financial data: {error}")
+            st.stop()
+
+    with st.spinner("Collecting company news..."):
+        try:
+            news = get_company_news(company.strip())
+        except Exception:
+            news = []
+
+    with st.spinner("Analyzing uploaded documents..."):
+        documents = extract_documents(uploaded_files or [])
+        query = (
+            f"{company} financial risk debt revenue profitability "
+            "legal compliance cash flow"
+        )
+        evidence = retrieve_documents(documents, query)
+
+    risks, warnings = analyze_risks(
+        financials, news, documents
+    )
+
+    st.subheader("1. Company Financial Summary")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Revenue", str(financials["Revenue"] or "N/A"))
+    with col2:
+        st.metric("Net Income", str(financials["Net Income"] or "N/A"))
+    with col3:
+        st.metric("Total Debt", str(financials["Total Debt"] or "N/A"))
+
+    st.dataframe(
+        pd.DataFrame(
+            list(financials.items()),
+            columns=["Metric", "Value"]
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("2. Stock Price History")
+    if not history.empty:
+        st.line_chart(history["Close"])
+        st.caption("Historical closing prices; not a price forecast.")
+    else:
+        st.info("No stock price history was returned.")
+
+    st.subheader("3. Company News")
+    if news:
+        st.dataframe(
+            pd.DataFrame(news),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.warning("No news was returned. Check your internet connection.")
+
+    st.subheader("4. Document Analysis Agent")
+    if evidence:
+        for index, item in enumerate(evidence, 1):
+            with st.expander(
+                f"Evidence {index}: {item['source']} "
+                f"(match {item['score']:.2f})"
+            ):
+                st.write(item["text"])
+    else:
+        st.info("Upload relevant PDF or TXT files to retrieve evidence.")
+
+    st.subheader("5. Synthesis Agent: Risk Findings")
+    for risk in risks:
+        st.warning(risk)
+
+    for warning in warnings:
+        st.info(warning)
+
+    st.subheader("6. Download Due Diligence Report")
+
+    report = f"""
+FINANCIAL DUE DILIGENCE REPORT
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}
+Company: {company}
+Ticker: {ticker}
+
+FINANCIAL METRICS
+"""
+    for key, value in financials.items():
+        report += f"\n{key}: {value}"
+
+    report += "\n\nRISK FINDINGS\n"
+    for risk in risks:
+        report += f"\n- {risk}"
+
+    report += "\n\nRESEARCH WARNINGS\n"
+    for warning in warnings:
+        report += f"\n- {warning}"
+
+    report += "\n\nNEWS SOURCES\n"
+    for item in news:
+        report += (
+            f"\n- {item['Headline']}"
+            f"\n  Source: {item['Source']}"
+            f"\n  URL: {item['URL']}\n"
+        )
+
+    report += "\nDOCUMENT EVIDENCE\n"
+    for item in evidence:
+        report += (
+            f"\nSource: {item['source']}"
+            f"\nMatch score: {item['score']:.3f}"
+            f"\n{item['text']}\n"
+        )
+
+    report += (
+        "\nLIMITATION: Automated screening only. "
+        "Verify all figures, dates, news, and document claims "
+        "against original sources before making decisions.\n"
+    )
+
+    st.download_button(
+        "Download Report (.txt)",
+        data=report,
+        file_name="due_diligence_report.txt",
+        mime="text/plain"
+    )
+
+    st.success("Report generated. Verify all findings before use.")
+else:
+    st.info(
+        "Enter the company details, optionally upload documents, "
+        "and click Generate Risk Report."
+    )
